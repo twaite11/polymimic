@@ -5,8 +5,8 @@ import os
 import sys
 
 # --- config ---
-MARKETS_FILE = "resolved_markets.csv"
-WALLETS_FILE = "unique_wallets.csv"
+MARKETS_FILE = "../resolved_markets.csv"
+WALLETS_FILE = "../unique_wallets.csv"
 HOLDERS_URL = "https://data-api.polymarket.com/holders"
 RATE_LIMIT_DELAY = 0.2
 BATCH_SIZE = 20

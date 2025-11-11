@@ -6,7 +6,8 @@ import sys
 import random
 
 # --- config ---
-MARKETS_FILE = "resolved_markets.csv"
+
+MARKETS_FILE = "markets_v2.csv" # Read from our new "v2" file
 TRADES_FILE = "all_trades.csv"
 TRADES_URL = "https://data-api.polymarket.com/trades"
 LIMIT = 1000
@@ -17,14 +18,14 @@ session = requests.Session()
 
 if not os.path.exists(MARKETS_FILE):
     print(f"Error: '{MARKETS_FILE}' not found.")
-    print("Please run Script 1 (fetch_markets.py) first.")
+    print("Please run Script 1 (fetch_markets_v2.py) first.")
     sys.exit(1)
 
 markets_df = pd.read_csv(MARKETS_FILE)
 market_ids = markets_df['conditionId'].unique()
-# testign old market hypothesis
-random.shuffle(market_ids)
 
+random.shuffle(market_ids)
+market_ids = market_ids[:7000]
 
 total_markets = len(market_ids)
 print(f"Loaded and *shuffled* {total_markets} resolved markets to process.")
@@ -43,7 +44,7 @@ for market_id in market_ids:
             'market': market_id,
             'limit': LIMIT,
             'offset': offset,
-            'takerOnly': False
+            'takerOnly': False # Get ALL trades (maker + taker)
         }
 
         try:
