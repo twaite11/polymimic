@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 # --- config ---
-MARKETS_FILE = Path("~/IdeaProjects/PolyCopy/preprocessing/scalar_trading/markets_v2.csv").expanduser()
+MARKETS_FILE = Path("~/IdeaProjects/PolyCopy/preprocessing/scalar_trading/markets_with_groups_v2.csv").expanduser()
 TRADES_FILE = Path("~/IdeaProjects/PolyCopy/preprocessing/scalar_trading/all_trades.csv").expanduser()
 REPORT_FILE = "wallet_master_analysis.csv"
 CHUNK_SIZE = 100000
