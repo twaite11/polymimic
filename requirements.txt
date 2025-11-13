@@ -1,7 +1,6 @@
 streamlit
 pandas
-sqlite3
 requests
 plotly
-python-dotenv
 matplotlib
+python-dotenv
