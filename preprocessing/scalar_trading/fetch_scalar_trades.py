@@ -25,7 +25,7 @@ markets_df = pd.read_csv(MARKETS_FILE)
 market_ids = markets_df['conditionId'].unique()
 
 random.shuffle(market_ids)
-market_ids = market_ids[:7000]
+
 
 total_markets = len(market_ids)
 print(f"Loaded and *shuffled* {total_markets} resolved markets to process.")
