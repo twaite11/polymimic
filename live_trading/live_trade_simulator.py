@@ -11,7 +11,7 @@ from pathlib import Path
 
 # --- config ---
 DEBUG_MODE = False
-
+HEARTBEAT_INTERVAL = 60 # Print a "." every 60 seconds to show it's alive
 
 load_dotenv()
 
@@ -45,8 +45,13 @@ def load_whales():
 
     print(f"Loading top {TOP_N_WHALES} whales from '{WHALE_REPORT_FILE}'...")
     df = pd.read_csv(WHALE_REPORT_FILE)
-    top_wallets = df.nlargest(TOP_N_WHALES, 'total_pnl')['user'].unique()
-    whale_wallets = set(top_wallets)
+    top_wallets_df = df.groupby('user')['total_pnl'].sum().nlargest(TOP_N_WHALES).reset_index()
+
+    # --- THIS IS THE FIX ---
+    # Convert all whale addresses to lowercase for reliable matching
+    whale_wallets = set(top_wallets_df['user'].str.lower().unique())
+    # --- END OF FIX ---
+
     print(f"Successfully loaded {len(whale_wallets)} unique whale wallets to monitor.")
 
 def setup_database():
@@ -89,13 +94,12 @@ def setup_database():
         print(f"Error setting up database: {e}")
         sys.exit(1)
 
-def log_trade(trade_data):
+def log_trade(trade_data, whale_wallet):
     """
     Called when a whale trade is detected. Inserts it into the database.
     """
     global db_conn
     try:
-        whale_wallet = trade_data.get('proxyWallet') # <-- This is our ASSUMPTION
         market_id = trade_data.get('conditionId')
         outcome = trade_data.get('outcome')
         side = trade_data.get('side')
@@ -109,7 +113,7 @@ def log_trade(trade_data):
                 print(f"[Debug] Skipping incomplete trade data: {trade_data}")
             return
 
-        print(f"🚨 WHALE TRADE DETECTED! [Wallet: {whale_wallet[:8]}... | Market: {market_id[:8]}... | {side} {outcome} @ {price:.2f}]")
+        print(f"\n🚨 WHALE TRADE DETECTED! [Wallet: {whale_wallet[:8]}... | Market: {market_id[:8]}... | {side} {outcome} @ {price:.2f}]")
 
         cursor = db_conn.cursor()
         cursor.execute('''
@@ -132,7 +136,7 @@ def on_message(ws, message):
     global whale_wallets
 
     if DEBUG_MODE:
-        print(message) # --- THIS IS THE FIX ---
+        print(message)
 
     try:
         data = json.loads(message)
@@ -142,16 +146,31 @@ def on_message(ws, message):
             if not trade:
                 return
 
-            trader_wallet = trade.get('proxyWallet') # <-- This is our ASSUMPTION
+            # --- THIS IS THE FIX (Part 1) ---
+            # Check 1: Is the TAKER one of our whales? (Convert to lowercase)
+            taker_wallet = trade.get('proxyWallet')
+            if taker_wallet and taker_wallet.lower() in whale_wallets:
+                log_trade(trade, taker_wallet)
+                return
 
-            if trader_wallet in whale_wallets:
-                log_trade(trade)
+                # --- THIS IS THE FIX (Part 2) ---
+            # Check 2: Is the MAKER one of our whales? (Convert to lowercase)
+            maker_orders = trade.get('maker_orders', [])
+            if not maker_orders:
+                return
+
+            for maker_order in maker_orders:
+                maker_wallet = maker_order.get('maker_address')
+                if maker_wallet and maker_wallet.lower() in whale_wallets:
+                    log_trade(trade, maker_wallet)
+                    break
+                    # --- END OF FIX ---
 
     except json.JSONDecodeError:
         pass
     except Exception as e:
         print(f"Error in on_message: {e}")
-        if not DEBUG_MODE: # Don't print message twice
+        if not DEBUG_MODE:
             print(f"Problematic message: {message}")
 
 def on_error(ws, error):
@@ -183,6 +202,7 @@ def on_open(ws):
 
     ws.send(json.dumps(subscribe_message))
     print("Sent authenticated subscription request for 'activity' feed.")
+    print(f"Bot is now silently listening... (will print '.' every {HEARTBEAT_INTERVAL}s)")
 
 def start_websocket():
     """
@@ -203,13 +223,18 @@ def start_websocket():
             wst.daemon = True
             wst.start()
 
+            # --- HEARTBEAT THREAD ---
+            # This loops in the main thread, printing a dot
+            # so you know the script is alive.
             while wst.is_alive():
-                wst.join(1)
+                time.sleep(HEARTBEAT_INTERVAL)
+                print(".", end="", flush=True)
+            # --- END HEARTBEAT ---
 
         except Exception as e:
             print(f"Websocket run_forever() crashed: {e}")
 
-        print("Connection lost. Reconnecting in 10 seconds...")
+        print("\nConnection lost. Reconnecting in 10 seconds...")
         time.sleep(10)
 
 # --- Main execution ---

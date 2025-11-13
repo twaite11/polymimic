@@ -110,9 +110,10 @@ CUSTOM_CSS = """
     .text-sell { color: #f94c4c !important; font-weight: 700; }
 
     /* --- (TICKER) --- */
+    /* *** CHANGED KEYFRAMES *** */
     @keyframes ticker {
-        0% { transform: translateX(100%); }
-        100% { transform: translateX(-100%); }
+        0% { transform: translateX(0); }
+        100% { transform: translateX(-50%); }
     }
     .ticker-wrap {
         width: 100%;
@@ -124,7 +125,7 @@ CUSTOM_CSS = """
     .ticker-move {
         display: inline-block;
         white-space: nowrap;
-        animation: ticker 45s linear infinite;
+        animation: ticker 15000s linear infinite;
         color: #FFFFFF;
         font-size: 1.2em; 
     }
@@ -211,41 +212,50 @@ def load_open_positions_ticker():
     conn = get_db_connection()
     markets_df = load_market_names()
 
+    base_text = "" # Initialize base_text
+
     if markets_df.empty or not conn:
-        return "Market data file not found. Run historical analysis."
+        base_text = "Market data file not found. Run historical analysis."
+    else:
+        try:
+            query = "SELECT * FROM trades WHERE is_resolved = 0 ORDER BY timestamp DESC"
+            positions_df = pd.read_sql_query(query, conn)
 
-    try:
-        query = "SELECT * FROM trades WHERE is_resolved = 0 ORDER BY timestamp DESC"
-        positions_df = pd.read_sql_query(query, conn)
 
-        if positions_df.empty:
-            return "No open simulated positions found. Waiting for whale activity..."
+            if positions_df.empty:
+                base_text = "No open simulated positions found. Waiting for whale activity..."
+            else:
+                merged_df = pd.merge(
+                    positions_df,
+                    markets_df,
+                    left_on='market_id',
+                    right_on='conditionId',
+                    how='left'
+                )
+                merged_df['question'] = merged_df['question'].fillna(merged_df['market_id'])
 
-        merged_df = pd.merge(
-            positions_df,
-            markets_df,
-            left_on='market_id',
-            right_on='conditionId',
-            how='left'
-        )
-        merged_df['question'] = merged_df['question'].fillna(merged_df['market_id'])
+                ticker_items = []
+                for _, row in merged_df.iterrows():
+                    side_class = "ticker-buy" if row['side'].upper() == 'BUY' else "ticker-sell"
+                    question_short = (row["question"][:70] + '...') if len(row["question"]) > 70 else row["question"]
 
-        ticker_items = []
-        for _, row in merged_df.iterrows():
-            side_class = "ticker-buy" if row['side'].upper() == 'BUY' else "ticker-sell"
-            question_short = (row["question"][:70] + '...') if len(row["question"]) > 70 else row["question"]
+                    item = (
+                        f'<span class="{side_class}">{row["side"].upper()}</span> '
+                        f'{question_short} @ ${row["price"]:.2f} | Whale: {row["whale_wallet"][:8]}...'
+                    )
+                    ticker_items.append(item)
 
-            item = (
-                f'<span class="{side_class}">{row["side"].upper()}</span> '
-                f'{question_short} @ ${row["price"]:.2f} | Whale: {row["whale_wallet"][:8]}...'
-            )
-            ticker_items.append(item)
+                base_text = "  |  ".join(ticker_items)
 
-        return "  |  ".join(ticker_items)
+        except Exception as e:
+            st.error(f"Error loading open positions for ticker: {e}")
+            base_text = "Error loading positions."
 
-    except Exception as e:
-        st.error(f"Error loading open positions for ticker: {e}")
-        return "Error loading positions."
+    if "..." not in base_text:
+        return "  |  ".join([base_text] * 10)
+
+    # If it is a list of trades, just duplicate it once for a seamless loop
+    return f"{base_text}  |  {base_text}"
 
 @st.cache_data
 def load_positions_as_html(is_resolved=0, limit=500):
@@ -311,6 +321,27 @@ def load_positions_as_html(is_resolved=0, limit=500):
         escape=False,
         index=False
     )
+@st.cache_data
+def load_top_profitable_whales():
+    """Fetches the top 5 whale wallets by total realized P&L."""
+    conn = get_db_connection()
+    if conn:
+        try:
+            query = """
+                    SELECT whale_wallet, SUM(pnl) as total_pnl
+                    FROM trades
+                    WHERE is_resolved = 1
+                    GROUP BY whale_wallet
+                    ORDER BY total_pnl DESC
+                        LIMIT 5 \
+                    """
+            df = pd.read_sql_query(query, conn)
+            return df
+        finally:
+            # Note: This conn.close() assumes you removed the @st.cache_resource
+            # decorator from get_db_connection as discussed previously.
+            conn.close()
+    return pd.DataFrame(columns=['whale_wallet', 'total_pnl'])
 
 # --- Main App Layout ---
 
@@ -363,7 +394,7 @@ st.markdown(ticker_html, unsafe_allow_html=True)
 
 st.markdown("---")
 
-if st.button("Run Daily Analysis & Refresh Data"):
+if st.button("Analyze & Refresh Data"):
     with st.spinner("Running daily analysis... this may take a few minutes..."):
         try:
             result = subprocess.run(
@@ -374,23 +405,18 @@ if st.button("Run Daily Analysis & Refresh Data"):
                 encoding='utf-8'
             )
             st.success("Analysis complete! Data has been refreshed.")
-            st.code(result.stdout)
-            if result.stderr:
-                st.warning("Analysis script reported errors:")
-                st.code(result.stderr)
 
-            st.cache_data.clear()
-            st.cache_resource.clear()
 
         except subprocess.CalledProcessError as e:
             st.error(f"Failed to run daily analyzer:")
-            st.code(e.stdout)
             st.code(e.stderr)
         except Exception as e:
             st.error(f"An unexpected error occurred: {e}")
 
-    st.rerun()
 
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    st.rerun()
 # graphs
 st.header("Simulation P&L")
 col1, col2 = st.columns(2)
@@ -445,12 +471,46 @@ st.markdown("---")
 st.header("Live Simulation Trades")
 col3, col4 = st.columns(2)
 
+# *** ALL TABLE LIMITS CHANGED TO 20 ***
 with col3:
-    st.subheader("Live Open Positions")
-    open_positions_html = load_positions_as_html(is_resolved=0)
+    st.subheader("Live Open Positions (Last 20)")
+    open_positions_html = load_positions_as_html(is_resolved=0, limit=20)
     st.markdown(open_positions_html, unsafe_allow_html=True)
 
 with col4:
-    st.subheader("Recent Closed Positions (Last 100)")
-    closed_positions_html = load_positions_as_html(is_resolved=1, limit=100)
+    st.subheader("Recent Closed Positions (Last 20)")
+    closed_positions_html = load_positions_as_html(is_resolved=1, limit=20)
     st.markdown(closed_positions_html, unsafe_allow_html=True)
+
+st.markdown("---")
+st.header("Americas Next Top Whales!!!")
+whale_df = load_top_profitable_whales()
+
+if whale_df.empty:
+    st.info("No resolved trades yet to rank whale profitability.")
+else:
+    # --- Custom Styling for Dashboard ---
+
+    # Apply your CSS classes for consistent styling
+    def style_whale_table(df):
+        styled_df = df.copy()
+
+        # Format P&L
+        styled_df['total_pnl'] = styled_df['total_pnl'].apply(
+            lambda pnl: f'<span class="text-buy">${pnl:+.2f}</span>' if pnl >= 0 else f'<span class="text-sell">${pnl:+.2f}</span>'
+        )
+
+        # Truncate wallet address for display
+        styled_df['whale_wallet'] = styled_df['whale_wallet'].str[:10] + '...'
+
+        # Rename columns for display
+        styled_df.columns = ['Whale Address', 'Total P&L']
+
+        # Convert to HTML using retro-table class
+        return styled_df.to_html(
+            classes='retro-table',
+            escape=False,
+            index=True # Keep index to show rank 1, 2, 3...
+        )
+
+    st.markdown(style_whale_table(whale_df), unsafe_allow_html=True)
