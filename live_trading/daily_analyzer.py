@@ -9,15 +9,14 @@ from dotenv import load_dotenv
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from pathlib import Path
-import time
 
 # --- config ---
 load_dotenv()
 
-# --- FILE PATH FIX ---
+
 DATABASE_FILE = Path("~/IdeaProjects/PolyCopy/db/simulation.db").expanduser()
 GRAPH_FILE = "pnl_over_time.png"
-# --- END FILE PATH FIX ---
+
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 MARKETS_URL = "https://gamma-api.polymarket.com/markets"
@@ -52,11 +51,6 @@ def fetch_market_results(market_ids):
     print(f"Fetching results for {len(market_ids)} specific markets from API...")
     results = {}
 
-    # --- ADDED HEADER TO PREVENT 403 FORBIDDEN ---
-    headers = {
-        'User-Agent': 'PolyMimic-Analyzer/1.0 (Python-Requests)'
-    }
-
     # We must query in batches, as the API may have a URL length limit
     for i in range(0, len(market_ids), BATCH_SIZE):
         batch_ids = market_ids[i : i + BATCH_SIZE]
@@ -67,7 +61,7 @@ def fetch_market_results(market_ids):
             params = {
                 'condition_ids': id_string
             }
-            response = requests.get(MARKETS_URL, params=params, headers=headers)
+            response = requests.get(MARKETS_URL, params=params)
             response.raise_for_status()
             markets_data = response.json()
 
@@ -77,19 +71,18 @@ def fetch_market_results(market_ids):
 
             for market in markets_data:
                 condition_id = market.get('conditionId')
-                if condition_id in batch_ids:
+                # --- CRITICAL FIX: Check for FINAL resolution status ---
+                # Markets are resolved when umaResolutionStatus is FINAL or RESOLVED
+                resolution_status = market.get('umaResolutionStatus')
 
-                    # *** UPDATED RESOLUTION CHECK: USE 'active' == False ***
-                    # This is more reliable than 'closed' == True
-                    if market.get('active') == False:
-                        outcomes, final_prices = parse_market_data(market)
-
-                        # Only proceed if we successfully parsed the final price data
-                        if outcomes and final_prices:
-                            results[condition_id] = {
-                                "outcomes": json.loads(outcomes),
-                                "final_prices": json.loads(final_prices)
-                            }
+                if condition_id in batch_ids and resolution_status in ['FINAL', 'RESOLVED']:
+                    # Parse the data
+                    outcomes, final_prices = parse_market_data(market)
+                    if outcomes and final_prices:
+                        results[condition_id] = {
+                            "outcomes": json.loads(outcomes),
+                            "final_prices": json.loads(final_prices)
+                        }
 
             time.sleep(0.2) # Rate limit
 
@@ -128,6 +121,7 @@ def parse_market_data(market_row):
             else:
                 prices_as_float.append(float(p))
 
+        # Check if the market is actually resolved (sum of prices should be close to 1)
         if not prices_as_float or sum(prices_as_float) < 0.01:
             return None, None
 
@@ -141,28 +135,14 @@ def calculate_pnl(trade, market_result):
     Calculates the P&L for a single simulated trade.
     """
     try:
-        # Get the list of all valid outcomes from the API, forced to uppercase
-        api_outcomes_upper = [o.upper() for o in market_result['outcomes']]
+        trade_outcome = trade['outcome'].upper()
 
-        # Check if the trade's outcome string matches any of the API's valid outcome strings
-        trade_outcome = str(trade['outcome']).upper()
+        if trade_outcome not in [o.upper() for o in market_result['outcomes']]:
+            return 0
 
-        if trade_outcome not in api_outcomes_upper:
-            # If the simple string doesn't match, attempt to use the trade outcome as a numerical index
-            try:
-                trade_index = int(trade['outcome'])
-                trade_outcome_resolved = api_outcomes_upper[trade_index]
-            except (ValueError, IndexError):
-                # If it's not a recognizable index or string, we cannot calculate PNL
-                return 0
-        else:
-            trade_outcome_resolved = trade_outcome
-
-        # Use the confirmed, resolved outcome string to find the index for the final price
-        trade_index = api_outcomes_upper.index(trade_outcome_resolved)
+        trade_index = [o.upper() for o in market_result['outcomes']].index(trade_outcome)
         settlement_price = market_result['final_prices'][trade_index]
 
-        # --- PNL Calculation Logic (Unchanged) ---
         purchase_price = trade['price']
         bet_amount = trade['simulated_bet']
 
@@ -215,7 +195,7 @@ def update_database(conn, trades_to_update, today_pnl):
     conn.commit()
     print(f"Updated P&L history for {today_str}. New total P&L: ${new_cumulative_pnl:.2f}")
 
-# --- 2. Reporting & Graphing Functions (Unchanged) ---
+# --- 2. Reporting & Graphing Functions ---
 
 def get_pnl_history(conn):
     """Fetches all P&L history for the graph."""

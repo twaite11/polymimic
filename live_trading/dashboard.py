@@ -195,7 +195,7 @@ CUSTOM_CSS = """
     .ticker-move {
         display: inline-block;
         white-space: nowrap;
-        animation: ticker 15000s linear infinite;
+        animation: ticker 500s linear infinite;
         color: #FFFFFF;
         font-size: 1.2em; 
     }
@@ -300,7 +300,7 @@ def load_open_positions_ticker():
         base_text = "Market data file not found. Run historical analysis."
     else:
         try:
-            query = "SELECT * FROM trades WHERE is_resolved = 0 ORDER BY timestamp DESC"
+            query = "SELECT * FROM trades WHERE is_resolved = 0 ORDER BY timestamp DESC LIMIT 500"
             positions_df = pd.read_sql_query(query, conn)
 
             if positions_df.empty:
@@ -522,7 +522,7 @@ with main_tab1:
         <p>This mess is held together by two scripts running in the background:</p>
         <ol>
             <li><strong>`live_trade_simulator.py`</strong>: A sleepless, crack-addled bot that eavesdrops 24/7 on Polymarket, snitching on every move your target whales make.</li>
-            <li><strong>`daily_analyzer.py`</strong>: This is the 'magic bean counter'. It digs through the graveyard of dead markets, figures out your P&L (profit or, more likely, loss), and pukes it all out onto the charts.</li>
+            <li><strong>`daily_analyzer.py`</strong>: This is the 'magic bean counter'. It digs through the graveyard of dead markets, figures out your P&L (profit or, more likely, loss), and pushes it into the charts.</li>
         </ol>
         """, unsafe_allow_html=True)
         st.markdown("---")

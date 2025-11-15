@@ -5,6 +5,7 @@ import pandas as pd
 import os
 import sys
 import time
+import logging # <-- 1. added this
 from threading import Thread
 from dotenv import load_dotenv
 from pathlib import Path
@@ -18,6 +19,7 @@ load_dotenv()
 # --- FILE PATHS ---
 WHALE_REPORT_FILE = Path("~/IdeaProjects/PolyCopy/modules/scalar_analysis/whale_report.csv").expanduser()
 DATABASE_FILE = Path("~/IdeaProjects/PolyCopy/db/simulation.db").expanduser()
+SIMULATOR_LOG_FILE = Path("~/IdeaProjects/PolyCopy/logs/simulator.log").expanduser()
 
 # --- AUTH KEYS ---
 API_KEY = os.getenv("POLYMARKET_API_KEY")
@@ -33,17 +35,48 @@ SIMULATED_BET_AMOUNT = 1.0 # $1 per trade
 db_conn = None
 whale_wallets = set()
 
+# 3. new function to set up logging
+def setup_logging():
+    """
+    Configures logging to print to both console and the log file.
+    """
+    try:
+        # ensure the 'logs' directory exists
+        SIMULATOR_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+        # set logging level
+        level = logging.DEBUG if DEBUG_MODE else logging.INFO
+
+        # basic config sets up the root logger
+        # using 'w' filemode to clear the log on each new run
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s - %(levelname)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+            handlers=[
+                logging.FileHandler(SIMULATOR_LOG_FILE, mode='w'), # writes to the file
+                logging.StreamHandler(sys.stdout) # writes to the console
+            ]
+        )
+
+        logging.info("Logging setup complete.")
+
+    except Exception as e:
+        print(f"Fatal Error: Could not set up logging. {e}")
+        sys.exit(1)
+
+
 def load_whales():
     """
     Loads the Top N whale wallets from the whale_report.csv file.
     """
     global whale_wallets
     if not os.path.exists(WHALE_REPORT_FILE):
-        print(f"Error: '{WHALE_REPORT_FILE}' not found.")
-        print("Please run 'find_whales.py' first to generate your whale list.")
+        logging.error(f"'{WHALE_REPORT_FILE}' not found.")
+        logging.error("Please run 'find_whales.py' first to generate your whale list.")
         sys.exit(1)
 
-    print(f"Loading top {TOP_N_WHALES} whales from '{WHALE_REPORT_FILE}'...")
+    logging.info(f"Loading top {TOP_N_WHALES} whales from '{WHALE_REPORT_FILE}'...")
     df = pd.read_csv(WHALE_REPORT_FILE)
     top_wallets_df = df.groupby('user')['total_pnl'].sum().nlargest(TOP_N_WHALES).reset_index()
 
@@ -52,7 +85,7 @@ def load_whales():
     whale_wallets = set(top_wallets_df['user'].str.lower().unique())
     # --- END OF FIX ---
 
-    print(f"Successfully loaded {len(whale_wallets)} unique whale wallets to monitor.")
+    logging.info(f"Successfully loaded {len(whale_wallets)} unique whale wallets to monitor.")
 
 def setup_database():
     """
@@ -88,10 +121,10 @@ def setup_database():
                        ''')
 
         db_conn.commit()
-        print(f"Database '{DATABASE_FILE}' is ready.")
+        logging.info(f"Database '{DATABASE_FILE}' is ready.")
 
     except sqlite3.Error as e:
-        print(f"Error setting up database: {e}")
+        logging.error(f"Error setting up database: {e}")
         sys.exit(1)
 
 def log_trade(trade_data, whale_wallet):
@@ -109,11 +142,10 @@ def log_trade(trade_data, whale_wallet):
         price = float(price_str)
 
         if not all([whale_wallet, market_id, outcome, side, price is not None]):
-            if DEBUG_MODE:
-                print(f"[Debug] Skipping incomplete trade data: {trade_data}")
+            logging.debug(f"Skipping incomplete trade data: {trade_data}")
             return
 
-        print(f"\n🚨 WHALE TRADE DETECTED! [Wallet: {whale_wallet[:8]}... | Market: {market_id[:8]}... | {side} {outcome} @ {price:.2f}]")
+        logging.info(f"🚨 WHALE TRADE DETECTED! [Wallet: {whale_wallet[:8]}... | Market: {market_id[:8]}... | {side} {outcome} @ {price:.2f}]")
 
         cursor = db_conn.cursor()
         cursor.execute('''
@@ -122,12 +154,12 @@ def log_trade(trade_data, whale_wallet):
                        ''', (whale_wallet, market_id, outcome, side, price, SIMULATED_BET_AMOUNT))
         db_conn.commit()
 
-        print(f"   -> Simulated $1.00 trade logged to database.")
+        logging.info(f"   -> Simulated $1.00 trade logged to database.")
 
     except sqlite3.Error as e:
-        print(f"Error logging trade to database: {e}")
+        logging.error(f"Error logging trade to database: {e}")
     except Exception as e:
-        print(f"Error parsing trade data: {e} | Data: {trade_data}")
+        logging.error(f"Error parsing trade data: {e} | Data: {trade_data}")
 
 def on_message(ws, message):
     """
@@ -135,8 +167,7 @@ def on_message(ws, message):
     """
     global whale_wallets
 
-    if DEBUG_MODE:
-        print(message)
+    logging.debug(message) # will only print if debug_mode is on
 
     try:
         data = json.loads(message)
@@ -169,21 +200,20 @@ def on_message(ws, message):
     except json.JSONDecodeError:
         pass
     except Exception as e:
-        print(f"Error in on_message: {e}")
-        if not DEBUG_MODE:
-            print(f"Problematic message: {message}")
+        logging.error(f"Error in on_message: {e}")
+        logging.debug(f"Problematic message: {message}")
 
 def on_error(ws, error):
-    print(f"--- WebSocket Error: {error} ---")
+    logging.warning(f"--- WebSocket Error: {error} ---")
 
 def on_close(ws, close_status_code, close_msg):
-    print(f"--- WebSocket Closed: {close_msg} (Code: {close_status_code}) ---")
+    logging.warning(f"--- WebSocket Closed: {close_msg} (Code: {close_status_code}) ---")
 
 def on_open(ws):
     """
     Called when the websocket connection is first established.
     """
-    print("--- WebSocket Connection Opened ---")
+    logging.info("--- WebSocket Connection Opened ---")
 
     subscribe_message = {
         "action": "subscribe",
@@ -201,8 +231,8 @@ def on_open(ws):
     }
 
     ws.send(json.dumps(subscribe_message))
-    print("Sent authenticated subscription request for 'activity' feed.")
-    print(f"Bot is now silently listening... (will print '.' every {HEARTBEAT_INTERVAL}s)")
+    logging.info("Sent authenticated subscription request for 'activity' feed.")
+    logging.info(f"Bot is now silently listening... (will print '.' every {HEARTBEAT_INTERVAL}s if DEBUG_MODE is on)")
 
 def start_websocket():
     """
@@ -210,7 +240,7 @@ def start_websocket():
     """
     while True:
         try:
-            print(f"Connecting to {WEBSOCKET_URL}...")
+            logging.info(f"Connecting to {WEBSOCKET_URL}...")
             ws = websocket.WebSocketApp(
                 WEBSOCKET_URL,
                 on_open=on_open,
@@ -224,31 +254,35 @@ def start_websocket():
             wst.start()
 
             # --- HEARTBEAT THREAD ---
-            # This loops in the main thread, printing a dot
+            # this loops in the main thread, printing a dot
             # so you know the script is alive.
             while wst.is_alive():
                 time.sleep(HEARTBEAT_INTERVAL)
-                print(".", end="", flush=True)
+                # 4. changed this to logging.debug
+                logging.debug(".") # prints a dot to the log in debug mode
             # --- END HEARTBEAT ---
 
         except Exception as e:
-            print(f"Websocket run_forever() crashed: {e}")
+            logging.error(f"Websocket run_forever() crashed: {e}")
 
-        print("\nConnection lost. Reconnecting in 10 seconds...")
+        logging.warning("Connection lost. Reconnecting in 10 seconds...")
         time.sleep(10)
 
 # --- Main execution ---
 if __name__ == "__main__":
+    # 5. set up logging first!
+    setup_logging()
+
     if not all([API_KEY, API_SECRET, API_PASSPHRASE]):
-        print("Error: POLYMARKET_API_KEY, SECRET, or PASSPHRASE not found in .env file.")
-        print("Please create a .env file with your API credentials.")
+        logging.error("Error: POLYMARKET_API_KEY, SECRET, or PASSPHRASE not found in .env file.")
+        logging.error("Please create a .env file with your API credentials.")
         sys.exit(1)
 
     load_whales()
     setup_database()
 
-    print("Starting live trade simulator bot. This will run 24/7.")
+    logging.info("Starting live trade simulator bot. This will run 24/7.")
     if DEBUG_MODE:
-        print("--- DEBUG MODE IS ON: ALL LIVE DATA WILL BE PRINTED ---")
-    print("Press CTRL+C to stop.")
+        logging.info("--- DEBUG MODE IS ON: ALL LIVE DATA WILL BE LOGGED ---")
+    logging.info("Press CTRL+C to stop.")
     start_websocket()
