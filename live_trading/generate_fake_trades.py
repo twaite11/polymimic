@@ -5,7 +5,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 # --- config ---
-DATABASE_FILE = Path("~/IdeaProjects/PolyCopy/db/simulation.db").expanduser()
+# use repo-relative path so streamlit cloud can write it
+DATABASE_FILE = Path("db/simulation.db")
 NUM_TRADES = 35  # generate 35 fake trades
 SIMULATED_BET_AMOUNT = 1.0  # $1 per trade
 

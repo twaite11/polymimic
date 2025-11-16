@@ -11,12 +11,13 @@ import json
 import time # 
 
 # --- config ---
-# file paths. gotta use expanduser() to handle the '~'
-WHALE_REPORT_FILE = Path("~/IdeaProjects/PolyCopy/modules/scalar_analysis/whale_report.csv").expanduser()
-DATABASE_FILE = Path("~/IdeaProjects/PolyCopy/db/simulation.db").expanduser()
-MARKETS_FILE = Path("~/IdeaProjects/PolyCopy/preprocessing/scalar_trading/markets_with_groups_v2.csv").expanduser()
-ANALYZER_SCRIPT_PATH = "daily_analyzer.py" # assumes it's in the same folder
-SIMULATOR_LOG_FILE = Path("~/IdeaProjects/PolyCopy/logs/simulator.log").expanduser()
+# repo-relative paths for streamlit cloud
+REPO_ROOT = Path(__file__).resolve().parent.parent
+WHALE_REPORT_FILE = REPO_ROOT / "modules" / "scalar_analysis" / "whale_report.csv"
+DATABASE_FILE = REPO_ROOT / "db" / "simulation.db"
+MARKETS_FILE = REPO_ROOT / "preprocessing" / "scalar_trading" / "markets_with_groups_v2.csv"
+ANALYZER_SCRIPT_PATH = (Path(__file__).resolve().parent / "daily_analyzer.py").as_posix()
+SIMULATOR_LOG_FILE = REPO_ROOT / "logs" / "simulator.log"
 
 # --- styling ---
 st.set_page_config(layout="wide", page_title="Whale Watcher Dashboard")
@@ -216,6 +217,9 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 def get_db_connection():
     """establishes a connection to the sqlite database."""
     try:
+        # ensure directories exist on first run
+        DATABASE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        (REPO_ROOT / "logs").mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(DATABASE_FILE, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
@@ -692,6 +696,28 @@ with main_tab1:
 
     # --- graphs ---
     st.header("Simulation P&L")
+
+    # first-run bootstrap: if db file doesn't exist or has no resolved trades, seed with fakes
+    try:
+        if not DATABASE_FILE.exists():
+            from live_trading import generate_fake_trades as gft
+            gft.main()
+        else:
+            conn_chk = sqlite3.connect(DATABASE_FILE)
+            cursor_chk = conn_chk.cursor()
+            cursor_chk.execute("SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='trades'")
+            has_trades_table = cursor_chk.fetchone()[0] == 1
+            seed_needed = True
+            if has_trades_table:
+                cursor_chk.execute("SELECT COUNT(1) FROM trades WHERE is_resolved = 1")
+                seed_needed = (cursor_chk.fetchone()[0] == 0)
+            conn_chk.close()
+            if seed_needed:
+                from live_trading import generate_fake_trades as gft
+                gft.main()
+    except Exception as e:
+        st.info("first-run bootstrap skipped.")
+
     col1, col2, col3 = st.columns([2, 2, 1])  # pie chart takes 1/5 of space
     layout_font = dict(family="'VT323', monospace", color="#dcd0ff", size=18)
 
