@@ -5,9 +5,10 @@ import os
 import sys
 import subprocess
 import plotly.express as px
+import plotly.graph_objects as go
 from pathlib import Path
 import json
-import time # <--- 1. add this line back
+import time # 
 
 # --- config ---
 # file paths. gotta use expanduser() to handle the '~'
@@ -237,18 +238,82 @@ def load_market_names():
 
 @st.cache_data
 def load_pnl_history():
-    """fetches all p&l history for the main graph."""
+    """builds daily cumulative p&l time series from resolved trades."""
     conn = get_db_connection()
     if conn:
         try:
-            df = pd.read_sql_query("SELECT timestamp, cumulative_pnl FROM pnl_history ORDER BY timestamp ASC", conn)
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            return df
-        except Exception as e:
-            # this can happen if the table doesn't exist yet
-            st.info("P&L history not found. Run analyzer.")
+            # build per-day realized pnl from resolved trades
+            trades_df = pd.read_sql_query("""
+                SELECT timestamp, pnl
+                FROM trades
+                WHERE is_resolved = 1
+            """, conn)
+            if trades_df.empty:
+                return pd.DataFrame(columns=['timestamp', 'cumulative_pnl'])
+
+            trades_df['timestamp'] = pd.to_datetime(trades_df['timestamp'])
+            trades_df['pnl'] = pd.to_numeric(trades_df['pnl'], errors='coerce').fillna(0.0)
+            trades_df['date'] = trades_df['timestamp'].dt.date
+
+            daily_pnl = trades_df.groupby('date', as_index=False)['pnl'].sum().sort_values('date')
+            daily_pnl['cumulative_pnl'] = daily_pnl['pnl'].cumsum()
+            daily_pnl['timestamp'] = pd.to_datetime(daily_pnl['date'])
+            return daily_pnl[['timestamp', 'cumulative_pnl']]
+        except Exception:
             return pd.DataFrame(columns=['timestamp', 'cumulative_pnl'])
     return pd.DataFrame(columns=['timestamp', 'cumulative_pnl'])
+
+@st.cache_data
+def load_roi_history():
+    """calculates cumulative roi (%) over time using daily aggregates.
+    
+    roi(t) = cumulative_pnl_to_date / cumulative_invested_to_date * 100
+    """
+    conn = get_db_connection()
+    if not conn:
+        return pd.DataFrame(columns=['timestamp', 'roi_percentage'])
+    
+    try:
+        # cumulative pnl by day (already cumulative in load_pnl_history)
+        pnl_df = load_pnl_history()
+        if pnl_df.empty:
+            return pd.DataFrame(columns=['timestamp', 'roi_percentage'])
+        pnl_df = pnl_df.copy()
+        pnl_df['date'] = pd.to_datetime(pnl_df['timestamp']).dt.date
+
+        # cumulative invested by day (all trades, regardless of resolution)
+        trades_df = pd.read_sql_query("""
+            SELECT timestamp, simulated_bet 
+            FROM trades
+        """, conn)
+        if trades_df.empty:
+            return pd.DataFrame(columns=['timestamp', 'roi_percentage'])
+        trades_df['timestamp'] = pd.to_datetime(trades_df['timestamp'])
+        trades_df['date'] = trades_df['timestamp'].dt.date
+
+        daily_invested = (
+            trades_df.groupby('date', as_index=False)['simulated_bet']
+            .sum()
+            .sort_values('date')
+            .rename(columns={'simulated_bet': 'invested'})
+        )
+        daily_invested['cumulative_invested'] = daily_invested['invested'].cumsum()
+
+        # align by date and compute cumulative roi
+        merged = pd.merge(pnl_df[['date', 'timestamp', 'cumulative_pnl']],
+                          daily_invested[['date', 'cumulative_invested']],
+                          on='date', how='left')
+        merged['cumulative_invested'] = merged['cumulative_invested'].ffill().fillna(0)
+
+        merged['roi_percentage'] = merged.apply(
+            lambda r: (r['cumulative_pnl'] / r['cumulative_invested'] * 100) if r['cumulative_invested'] > 0 else 0,
+            axis=1
+        )
+
+        return merged[['timestamp', 'roi_percentage']]
+    except Exception as e:
+        st.error(f"error loading roi history: {e}")
+        return pd.DataFrame(columns=['timestamp', 'roi_percentage'])
 
 @st.cache_data
 def load_market_group_pnl():
@@ -296,32 +361,45 @@ def load_open_positions_ticker():
     base_text = ""
     latest_timestamp = None
 
-    if markets_df.empty or not conn:
-        base_text = "Market data file not found. Run historical analysis."
+    if not conn:
+        base_text = "database connection error."
     else:
         try:
+            # query includes question from database (now stored directly in trades table)
             query = "SELECT * FROM trades WHERE is_resolved = 0 ORDER BY timestamp DESC LIMIT 500"
             positions_df = pd.read_sql_query(query, conn)
 
             if positions_df.empty:
-                base_text = "No open simulated positions found. Waiting for whale activity..."
+                base_text = "no open simulated positions found. waiting for whale activity..."
             else:
                 # get the timestamp of the *newest* trade for the toast
                 latest_timestamp = pd.to_datetime(positions_df['timestamp']).max()
 
-                merged_df = pd.merge(
-                    positions_df,
-                    markets_df,
-                    left_on='market_id',
-                    right_on='conditionId',
-                    how='left'
-                )
-                merged_df['question'] = merged_df['question'].fillna(merged_df['market_id'])
+                # if question is null in database, try to get it from the csv file as fallback
+                if not markets_df.empty:
+                    merged_df = pd.merge(
+                        positions_df,
+                        markets_df,
+                        left_on='market_id',
+                        right_on='conditionId',
+                        how='left',
+                        suffixes=('', '_csv')
+                    )
+                    # use question from database, fallback to csv question, then to market_id
+                    if 'question_csv' in merged_df.columns:
+                        merged_df['question'] = merged_df['question'].fillna(merged_df['question_csv'])
+                    merged_df['question'] = merged_df['question'].fillna(merged_df['market_id'])
+                    # drop the csv question column if it exists
+                    merged_df = merged_df.drop(columns=['question_csv'], errors='ignore')
+                    positions_df = merged_df
+                else:
+                    # if no csv file, use question from db or fallback to market_id
+                    positions_df['question'] = positions_df['question'].fillna(positions_df['market_id'])
 
                 ticker_items = []
-                for _, row in merged_df.iterrows():
+                for _, row in positions_df.iterrows():
                     side_class = "ticker-buy" if row['side'].upper() == 'BUY' else "ticker-sell"
-                    question_short = (row["question"][:70] + '...') if len(row["question"]) > 70 else row["question"]
+                    question_short = (row["question"][:70] + '...') if row["question"] and len(str(row["question"])) > 70 else (row["question"] if row["question"] else "N/A")
 
                     item = (
                         f'<span class="{side_class}">{row["side"].upper()}</span> '
@@ -332,31 +410,32 @@ def load_open_positions_ticker():
                 base_text = "  |  ".join(ticker_items)
 
         except Exception as e:
-            st.error(f"Error loading open positions for ticker: {e}")
-            base_text = "Error loading positions."
+            st.error(f"error loading open positions for ticker: {e}")
+            base_text = "error loading positions."
 
     # duplicate the text to make the ticker loop seamless
     if "..." not in base_text:
-        ticker_content = "  |  ".join([base_text] * 10) # static message, repeat a lot
+        ticker_content = "  |  ".join([base_text] * 10)  # static message, repeat a lot
     else:
-        ticker_content = f"{base_text}  |  {base_text}" # trade list, just duplicate once
+        ticker_content = f"{base_text}  |  {base_text}"  # trade list, just duplicate once
 
     return ticker_content, latest_timestamp
 
 @st.cache_data
 def load_positions_as_html(is_resolved=0, limit=500):
     """
-    fetches open (0) or closed (1) positions and joins
-    with market names, returning a styled html table.
+    fetches open (0) or closed (1) positions and returns
+    a styled html table with market questions.
     """
     conn = get_db_connection()
     markets_df = load_market_names()
 
-    if markets_df.empty or not conn:
-        return "<p>No data found. Market file may be missing.</p>"
+    if not conn:
+        return "<p>No data found. Database connection error.</p>"
 
+    # query includes question from database (now stored directly in trades table)
     query = f"""
-        SELECT timestamp, whale_wallet, side, outcome, price, market_id, pnl
+        SELECT timestamp, whale_wallet, side, outcome, price, market_id, question, pnl
         FROM trades 
         WHERE is_resolved = {is_resolved}
         ORDER BY timestamp DESC
@@ -370,14 +449,26 @@ def load_positions_as_html(is_resolved=0, limit=500):
         else:
             return "<p>No positions have been resolved yet.</p>"
 
-    df_merged = pd.merge(
-        df,
-        markets_df,
-        left_on='market_id',
-        right_on='conditionId',
-        how='left'
-    )
-    df_merged['question'] = df_merged['question'].fillna(df_merged['market_id'])
+    # if question is null in database, try to get it from the csv file as fallback
+    if not markets_df.empty:
+        df_merged = pd.merge(
+            df,
+            markets_df,
+            left_on='market_id',
+            right_on='conditionId',
+            how='left',
+            suffixes=('', '_csv')
+        )
+        # use question from database, fallback to csv question, then to market_id
+        if 'question_csv' in df_merged.columns:
+            df_merged['question'] = df_merged['question'].fillna(df_merged['question_csv'])
+        df_merged['question'] = df_merged['question'].fillna(df_merged['market_id'])
+        # drop the csv question column if it exists
+        df_merged = df_merged.drop(columns=['question_csv'], errors='ignore')
+        df = df_merged
+    else:
+        # if no csv file, use question from db or fallback to market_id
+        df['question'] = df['question'].fillna(df['market_id'])
 
     # helper funcs to style the table cells
     def style_side(side):
@@ -395,20 +486,21 @@ def load_positions_as_html(is_resolved=0, limit=500):
         else:
             return f'${pnl_num:.2f}'
 
-    df_merged['side'] = df_merged['side'].apply(style_side)
-    df_merged['pnl'] = df_merged['pnl'].apply(style_pnl)
-    df_merged['price'] = df_merged['price'].map('${:,.2f}'.format)
-    df_merged['whale_wallet'] = df_merged['whale_wallet'].str[:10] + '...'
-    df_merged['question'] = df_merged['question'].str[:50] + '...'
-    df_merged['timestamp'] = pd.to_datetime(df_merged['timestamp']).dt.strftime('%Y-%m-%d %H:%M')
+    df['side'] = df['side'].apply(style_side)
+    df['pnl'] = df['pnl'].apply(style_pnl)
+    df['price'] = df['price'].map('${:,.2f}'.format)
+    df['whale_wallet'] = df['whale_wallet'].str[:10] + '...'
+    # truncate question if too long, but show more than before (80 chars instead of 50)
+    df['question'] = df['question'].apply(lambda x: (x[:80] + '...') if x and len(str(x)) > 80 else (x if x else 'N/A'))
+    df['timestamp'] = pd.to_datetime(df['timestamp']).dt.strftime('%Y-%m-%d %H:%M')
 
-    # reorder cols for display
+    # reorder cols for display (question replaces market_id)
     if is_resolved == 0:
         final_cols = ['timestamp', 'whale_wallet', 'side', 'outcome', 'price', 'question']
     else:
         final_cols = ['timestamp', 'whale_wallet', 'side', 'outcome', 'price', 'question', 'pnl']
 
-    df_final = df_merged[final_cols]
+    df_final = df[final_cols]
 
     return df_final.to_html(
         classes='retro-table',
@@ -502,6 +594,15 @@ main_tab1, main_tab2 = st.tabs([" DASHBOARD ", " LIVE LOG FEED "])
 
 # --- dashboard tab ---
 with main_tab1:
+    # retro neon color scheme (defined at top for use throughout)
+    neon_purple = "#a991d4"
+    neon_blue = "#4a9eff"
+    neon_cyan = "#00ffff"
+    dark_purple = "#7348c3"
+    dark_blue = "#1e3a8a"
+    win_color = "#7c3aed"  # purple for wins
+    loss_color = "#a855f7"  # lighter purple for losses
+    
     # initialize session state for the help toggle
     if 'show_help' not in st.session_state:
         st.session_state.show_help = False
@@ -591,8 +692,8 @@ with main_tab1:
 
     # --- graphs ---
     st.header("Simulation P&L")
-    col1, col2 = st.columns(2)
-    layout_font = dict(family="VT323, monospace", color="#dcd0ff", size=16)
+    col1, col2, col3 = st.columns([2, 2, 1])  # pie chart takes 1/5 of space
+    layout_font = dict(family="'VT323', monospace", color="#dcd0ff", size=18)
 
     with col1:
         st.subheader("Total P&L Over Time")
@@ -608,11 +709,44 @@ with main_tab1:
                 title="Total Simulation P&L",
                 template="plotly_dark"
             )
-            fig_line.update_traces(line=dict(color='#a991d4', width=3))
+            # neon purple line with glow effect
+            fig_line.update_traces(
+                line=dict(color=neon_purple, width=4),
+                marker=dict(size=8, color=neon_cyan, line=dict(width=2, color=neon_purple)),
+                fill='tonexty',
+                fillcolor=f'rgba(169, 145, 212, 0.1)'
+            )
             fig_line.update_layout(
-                paper_bgcolor="#0E1117",
-                plot_bgcolor="#1f2333",
-                font=layout_font
+                paper_bgcolor="#0a0a0f",
+                plot_bgcolor="#0a0a0f",
+                font=layout_font,
+                title_font=dict(size=22, color=neon_cyan, family="'VT323', monospace"),
+                xaxis=dict(
+                    gridcolor='rgba(169, 145, 212, 0.2)',
+                    gridwidth=1,
+                    showgrid=True,
+                    zeroline=False,
+                    linecolor=neon_purple,
+                    linewidth=2,
+                    tickfont=dict(family="'VT323', monospace", size=16, color="#dcd0ff"),
+                ),
+                yaxis=dict(
+                    gridcolor='rgba(169, 145, 212, 0.2)',
+                    gridwidth=1,
+                    showgrid=True,
+                    zeroline=True,
+                    zerolinecolor=neon_purple,
+                    zerolinewidth=2,
+                    linecolor=neon_purple,
+                    linewidth=2,
+                    tickfont=dict(family="'VT323', monospace", size=16, color="#dcd0ff")
+                ),
+                hovermode='x unified',
+                hoverlabel=dict(
+                    bgcolor='rgba(10, 10, 15, 0.9)',
+                    bordercolor=neon_purple,
+                    font=dict(color=neon_cyan, family="'VT323', monospace", size=16)
+                )
             )
             st.plotly_chart(fig_line, use_container_width=True)
 
@@ -628,45 +762,180 @@ with main_tab1:
                 x='market_group',
                 y='pnl',
                 title="Total P&L by Market Group",
-                template="plotly_dark",
-                color_discrete_sequence=['#a991d4']
+                template="plotly_dark"
+            )
+            # neon gradient bars with purple/blue theme
+            # create color array based on pnl values
+            pnl_values = group_pnl_df['pnl'].values
+            min_pnl = pnl_values.min()
+            max_pnl = pnl_values.max()
+            
+            # normalize for colorscale (0 to 1)
+            if max_pnl != min_pnl:
+                normalized = (pnl_values - min_pnl) / (max_pnl - min_pnl)
+            else:
+                normalized = [0.5] * len(pnl_values)
+            
+            fig_bar.update_traces(
+                marker=dict(
+                    color=normalized,
+                    colorscale=[[0, dark_purple], [0.5, neon_purple], [1, neon_cyan]],
+                    showscale=True,
+                    colorbar=dict(
+                        title="P&L",
+                        titlefont=dict(color=neon_cyan, family="'VT323', monospace", size=16),
+                        tickfont=dict(color=neon_cyan, family="'VT323', monospace", size=14),
+                        bordercolor=neon_purple,
+                        borderwidth=2,
+                        len=0.5
+                    ),
+                    line=dict(width=2, color=neon_cyan)
+                )
             )
             fig_bar.update_layout(
-                paper_bgcolor="#0E1117",
-                plot_bgcolor="#1f2333",
-                font=layout_font
+                paper_bgcolor="#0a0a0f",
+                plot_bgcolor="#0a0a0f",
+                font=layout_font,
+                title_font=dict(size=22, color=neon_cyan, family="'VT323', monospace"),
+                xaxis=dict(
+                    gridcolor='rgba(169, 145, 212, 0.2)',
+                    gridwidth=1,
+                    showgrid=True,
+                    linecolor=neon_purple,
+                    linewidth=2,
+                    tickfont=dict(family="'VT323', monospace", size=14, color="#dcd0ff"),
+                ),
+                yaxis=dict(
+                    gridcolor='rgba(169, 145, 212, 0.2)',
+                    gridwidth=1,
+                    showgrid=True,
+                    zeroline=True,
+                    zerolinecolor=neon_purple,
+                    zerolinewidth=2,
+                    linecolor=neon_purple,
+                    linewidth=2,
+                    tickfont=dict(family="'VT323', monospace", size=16, color="#dcd0ff")
+                ),
+                hoverlabel=dict(
+                    bgcolor='rgba(10, 10, 15, 0.9)',
+                    bordercolor=neon_purple,
+                    font=dict(color=neon_cyan, family="'VT323', monospace", size=16)
+                )
             )
             st.plotly_chart(fig_bar, use_container_width=True)
 
-    # --- win/loss chart (new!) ---
-    # putting this in a new row to give it space
-    st.subheader("Simulation Win/Loss Ratio")
-    win_loss = load_win_loss_ratio()
+    # --- win/loss chart (smaller, in column 3) ---
+    with col3:
+        st.subheader("Win/Loss")
+        win_loss = load_win_loss_ratio()
 
-    if win_loss['wins'] == 0 and win_loss['losses'] == 0:
-        st.info("No resolved trades to calculate ratio.")
+        if win_loss['wins'] == 0 and win_loss['losses'] == 0:
+            st.info("No resolved trades.")
+        else:
+            total_trades = int(win_loss['wins'] + win_loss['losses'])
+            win_rate = (float(win_loss['wins']) / total_trades) * 100 if total_trades > 0 else 0.0
+
+            # neon gauge: cumulative win rate
+            fig_gauge = go.Figure(go.Indicator(
+                mode="gauge+number",
+                value=round(win_rate, 1),
+                number={
+                    "suffix": "%",
+                    "font": {"family": "VT323, monospace", "size": 42, "color": neon_cyan}
+                },
+                title={"text": "win rate", "font": {"family": "VT323, monospace", "size": 18, "color": neon_cyan}},
+                gauge={
+                    "axis": {"range": [0, 100], "tickwidth": 2, "tickcolor": neon_purple},
+                    "bar": {"color": win_color, "thickness": 0.3},
+                    # retro neon gradient steps for the remaining arc
+                    "steps": [
+                        {"range": [0, 50], "color": "rgba(115, 72, 195, 0.25)"},
+                        {"range": [50, 80], "color": "rgba(169, 145, 212, 0.25)"},
+                        {"range": [80, 100], "color": "rgba(0, 255, 255, 0.2)"}
+                    ],
+                    "threshold": {
+                        "line": {"color": neon_cyan, "width": 4},
+                        "thickness": 0.6,
+                        "value": win_rate
+                    }
+                },
+                domain={"x": [0, 1], "y": [0.12, 1]}
+            ))
+
+            fig_gauge.update_layout(
+                paper_bgcolor="#0a0a0f",
+                plot_bgcolor="#0a0a0f",
+                margin=dict(l=10, r=10, t=30, b=30),
+                height=360,
+                font=layout_font,
+            )
+
+            # add small retro annotations (total trades)
+            fig_gauge.add_annotation(
+                text=f"{total_trades} trades",
+                x=0.5, y=0.02, xref="paper", yref="paper",
+                showarrow=False,
+                font=dict(family="VT323, monospace", size=14, color="#a991d4")
+            )
+
+            st.plotly_chart(fig_gauge, use_container_width=True)
+
+    # --- roi percentage chart (new row) ---
+    st.markdown("---")
+    st.subheader("ROI Percentage Over Time")
+    roi_df = load_roi_history()
+    
+    if roi_df.empty:
+        st.info("No ROI data available. Run daily analyzer after some trades have resolved.")
     else:
-        pie_df = pd.DataFrame({
-            'outcome': ['Wins', 'Losses'],
-            'count': [win_loss['wins'], win_loss['losses']]
-        })
-        fig_pie = px.pie(
-            pie_df,
-            values='count',
-            names='outcome',
-            title="Resolved Trades",
-            template="plotly_dark",
-            color_discrete_map={'Wins':'#3dd56d', 'Losses':'#f94c4c'},
-            hole=0.4 # donut chart!
+        fig_roi = px.line(
+            roi_df,
+            x='timestamp',
+            y='roi_percentage',
+            title="Return on Investment (%)",
+            template="plotly_dark"
         )
-        fig_pie.update_layout(
-            paper_bgcolor="#0E1117",
-            plot_bgcolor="#1f2333",
+        # neon blue line for roi
+        fig_roi.update_traces(
+            line=dict(color=neon_blue, width=4),
+            marker=dict(size=8, color=neon_cyan, line=dict(width=2, color=neon_blue)),
+            fill='tonexty',
+            fillcolor=f'rgba(74, 158, 255, 0.1)'
+        )
+        fig_roi.update_layout(
+            paper_bgcolor="#0a0a0f",
+            plot_bgcolor="#0a0a0f",
             font=layout_font,
-            legend=dict(font=dict(size=14))
+            title_font=dict(size=22, color=neon_cyan, family="'VT323', monospace"),
+            xaxis=dict(
+                gridcolor='rgba(169, 145, 212, 0.2)',
+                gridwidth=1,
+                showgrid=True,
+                zeroline=False,
+                linecolor=neon_purple,
+                linewidth=2,
+                tickfont=dict(family="'VT323', monospace", size=16, color="#dcd0ff")
+            ),
+            yaxis=dict(
+                gridcolor='rgba(169, 145, 212, 0.2)',
+                gridwidth=1,
+                showgrid=True,
+                zeroline=True,
+                zerolinecolor=neon_purple,
+                zerolinewidth=2,
+                linecolor=neon_purple,
+                linewidth=2,
+                tickfont=dict(family="'VT323', monospace", size=16, color="#dcd0ff"),
+                ticksuffix="%"
+            ),
+            hovermode='x unified',
+            hoverlabel=dict(
+                bgcolor='rgba(10, 10, 15, 0.9)',
+                bordercolor=neon_purple,
+                font=dict(color=neon_cyan, family="'VT323', monospace", size=16)
+            )
         )
-        fig_pie.update_traces(textfont_size=16)
-        st.plotly_chart(fig_pie, use_container_width=True)
+        st.plotly_chart(fig_roi, use_container_width=True)
 
 
     # --- open/close tables (now in tabs!) ---
@@ -757,12 +1026,44 @@ with main_tab1:
                 title=f"P&L Over Time for {selected_whale_display[:10]}...",
                 template="plotly_dark"
             )
-            # green for profit!
-            fig_whale.update_traces(line=dict(color='#3dd56d', width=3))
+            # neon cyan for whale profit
+            fig_whale.update_traces(
+                line=dict(color=neon_cyan, width=4),
+                marker=dict(size=8, color=neon_cyan, line=dict(width=2, color=neon_purple)),
+                fill='tonexty',
+                fillcolor=f'rgba(0, 255, 255, 0.1)'
+            )
             fig_whale.update_layout(
-                paper_bgcolor="#0E1117",
-                plot_bgcolor="#1f2333",
-                font=layout_font
+                paper_bgcolor="#0a0a0f",
+                plot_bgcolor="#0a0a0f",
+                font=layout_font,
+                title_font=dict(size=22, color=neon_cyan, family="'VT323', monospace"),
+                xaxis=dict(
+                    gridcolor='rgba(169, 145, 212, 0.2)',
+                    gridwidth=1,
+                    showgrid=True,
+                    zeroline=False,
+                    linecolor=neon_purple,
+                    linewidth=2,
+                    tickfont=dict(family="'VT323', monospace", size=16, color="#dcd0ff")
+                ),
+                yaxis=dict(
+                    gridcolor='rgba(169, 145, 212, 0.2)',
+                    gridwidth=1,
+                    showgrid=True,
+                    zeroline=True,
+                    zerolinecolor=neon_purple,
+                    zerolinewidth=2,
+                    linecolor=neon_purple,
+                    linewidth=2,
+                    tickfont=dict(family="'VT323', monospace", size=16, color="#dcd0ff")
+                ),
+                hovermode='x unified',
+                hoverlabel=dict(
+                    bgcolor='rgba(10, 10, 15, 0.9)',
+                    bordercolor=neon_purple,
+                    font=dict(color=neon_cyan, family="'VT323', monospace", size=16)
+                )
             )
             st.plotly_chart(fig_whale, use_container_width=True)
 
