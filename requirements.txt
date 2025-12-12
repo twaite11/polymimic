@@ -4,3 +4,5 @@ requests
 plotly
 matplotlib
 python-dotenv
+google-generativeai
+websocket-client

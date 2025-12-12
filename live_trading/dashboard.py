@@ -589,8 +589,8 @@ def get_latest_logs(num_lines=50):
 
 st.title(" 〽️ PolyMimic: A PolyMarket Copy-Trading Simulator")
 
-# create the main tabs for dashboard vs log
-main_tab1, main_tab2 = st.tabs([" DASHBOARD ", " LIVE LOG FEED "])
+# create the main tabs for dashboard vs log vs financial expert
+main_tab1, main_tab2, main_tab3 = st.tabs([" DASHBOARD ", " LIVE LOG FEED ", " FINANCIAL EXPERT AI "])
 
 # --- dashboard tab ---
 with main_tab1:
@@ -1083,3 +1083,166 @@ with main_tab2:
     # it works on all streamlit versions
     time.sleep(10)
     st.rerun()
+
+# --- Financial Expert AI tab ---
+with main_tab3:
+    st.header("💼 Financial Expert AI Advisor")
+    st.markdown("Chat with an AI financial expert that analyzes whale trading patterns and provides insights.")
+    
+    # Import the gemini expert module
+    import sys
+    import os
+    # Add current directory to path for imports
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    if current_dir not in sys.path:
+        sys.path.insert(0, current_dir)
+    
+    try:
+        from gemini_expert import chat_with_financial_expert, get_financial_expert_context
+        GEMINI_EXPERT_AVAILABLE = True
+    except ImportError as e:
+        GEMINI_EXPERT_AVAILABLE = False
+        st.error(f"Gemini expert module not available: {e}. Please ensure google-generativeai is installed and gemini_expert.py exists.")
+    
+    if GEMINI_EXPERT_AVAILABLE:
+        # Initialize chat history in session state
+        if "expert_messages" not in st.session_state:
+            st.session_state.expert_messages = []
+        
+        # Display chat history
+        chat_container = st.container()
+        with chat_container:
+            if st.session_state.expert_messages:
+                for message in st.session_state.expert_messages:
+                    role = message["role"]
+                    content = message["content"]
+                    
+                    if role == "user":
+                        with st.chat_message("user"):
+                            st.markdown(content)
+                    else:
+                        with st.chat_message("assistant"):
+                            st.markdown(content)
+            else:
+                # Show welcome message
+                with st.chat_message("assistant"):
+                    st.markdown("""
+                    👋 **Welcome to the Financial Expert AI Advisor!**
+                    
+                    I'm your financial markets expert, specializing in prediction markets and whale trading analysis. 
+                    
+                    I can help you:
+                    - 📊 Analyze whale trading patterns and performance
+                    - 🎯 Identify which whales show signs of insider information
+                    - 💡 Provide insights on market categories and strategies
+                    - 🔍 Explain trading patterns and statistical anomalies
+                    - 📈 Recommend which whales to follow based on data
+                    
+                    Ask me anything about your whale trading data, market analysis, or trading strategies!
+                    """)
+        
+        # Chat input
+        user_input = st.chat_input("Ask the financial expert...")
+        
+        if user_input:
+            # Add user message to history
+            st.session_state.expert_messages.append({"role": "user", "content": user_input})
+            
+            # Show user message immediately
+            with st.chat_message("user"):
+                st.markdown(user_input)
+            
+            # Get response from financial expert
+            with st.chat_message("assistant"):
+                with st.spinner("Analyzing whale data and consulting financial expertise..."):
+                    try:
+                        # Prepare conversation history for context
+                        conversation_history = st.session_state.expert_messages[:-1]  # Exclude current message
+                        
+                        # Get expert response
+                        response = chat_with_financial_expert(
+                            user_input,
+                            conversation_history=conversation_history,
+                            include_data=True
+                        )
+                        
+                        # Display response
+                        st.markdown(response)
+                        
+                        # Add assistant response to history
+                        st.session_state.expert_messages.append({"role": "assistant", "content": response})
+                        
+                    except Exception as e:
+                        error_msg = f"Error: {str(e)}"
+                        st.error(error_msg)
+                        st.session_state.expert_messages.append({"role": "assistant", "content": error_msg})
+        
+        # Sidebar with quick actions
+        with st.sidebar:
+            st.markdown("### 🚀 Quick Questions")
+            
+            if st.button("📊 Analyze Top Whale"):
+                if "expert_messages" not in st.session_state:
+                    st.session_state.expert_messages = []
+                st.session_state.expert_messages.append({
+                    "role": "user",
+                    "content": "Which whale shows the strongest signs of insider information or exceptional predictive ability? Provide a detailed analysis."
+                })
+                st.rerun()
+            
+            if st.button("💡 Category Strategy"):
+                if "expert_messages" not in st.session_state:
+                    st.session_state.expert_messages = []
+                st.session_state.expert_messages.append({
+                    "role": "user",
+                    "content": "Based on the whale trading data, which market categories are most profitable and why?"
+                })
+                st.rerun()
+            
+            if st.button("🎯 Trading Insights"):
+                if "expert_messages" not in st.session_state:
+                    st.session_state.expert_messages = []
+                st.session_state.expert_messages.append({
+                    "role": "user",
+                    "content": "What are the key insights from the whale trading patterns? What strategies seem to work best?"
+                })
+                st.rerun()
+            
+            if st.button("🔍 Risk Assessment"):
+                if "expert_messages" not in st.session_state:
+                    st.session_state.expert_messages = []
+                st.session_state.expert_messages.append({
+                    "role": "user",
+                    "content": "Assess the overall risk and performance of the whale copy-trading strategy. What are the potential risks?"
+                })
+                st.rerun()
+            
+            st.markdown("---")
+            if st.button("🗑️ Clear Chat History"):
+                st.session_state.expert_messages = []
+                st.rerun()
+            
+            st.markdown("---")
+            st.markdown("### ℹ️ About")
+            st.markdown("""
+            The Financial Expert AI uses Google's Gemini model to provide expert financial analysis based on your whale trading data.
+            
+            Make sure `GEMINI_API_KEY` is set in your `.env` file.
+            """)
+    
+    else:
+        st.info("""
+        **Setup Required:**
+        
+        1. Install the required package:
+           ```bash
+           pip install google-generativeai
+           ```
+        
+        2. Add your Gemini API key to `.env`:
+           ```
+           GEMINI_API_KEY=your_api_key_here
+           ```
+        
+        3. Get your API key from: https://makersuite.google.com/app/apikey
+        """)

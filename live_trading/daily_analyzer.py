@@ -11,6 +11,28 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from pathlib import Path
 
+# Market category keywords (simplified matching)
+MARKET_KEYWORD_GROUPS = {
+    "us_politics": ["trump", "biden", "election", "republican", "democratic", "president", "senate", "house"],
+    "sports_nfl": ["nfl", "super bowl", "chiefs", "eagles", "football"],
+    "sports_nba": ["nba", "basketball", "lakers", "warriors", "celtics"],
+    "tech_ai": ["ai", "openai", "google", "apple", "meta", "tesla", "elon"],
+    "crypto": ["crypto", "bitcoin", "ethereum", "btc", "eth", "token"],
+    "finance": ["earnings", "stock", "market", "inflation", "fed", "interest"],
+    "geopolitics": ["ukraine", "russia", "china", "israel", "gaza", "nato"],
+    "entertainment": ["movie", "netflix", "taylor swift", "grammy", "oscar"]
+}
+
+def extract_market_category(question):
+    """Extracts market category from question text."""
+    if not question or not isinstance(question, str):
+        return "other"
+    q_lower = question.lower()
+    for category, keywords in MARKET_KEYWORD_GROUPS.items():
+        if any(keyword in q_lower for keyword in keywords):
+            return category
+    return "other"
+
 # --- config ---
 load_dotenv()
 
@@ -222,15 +244,116 @@ def calculate_pnl(trade, market_result):
 def update_database(conn, trades_to_update, today_pnl):
     """
     updates trades to 'is_resolved=1' and logs daily p&l.
+    Also updates whale statistics and tracks successful trades.
     """
     cursor = conn.cursor()
 
     for trade_id, pnl in trades_to_update:
+        # Update trade
         cursor.execute('''
                        UPDATE trades
                        SET is_resolved = 1, pnl = ?
                        WHERE id = ?
                        ''', (pnl, trade_id))
+        
+        # Get trade details for whale stats update
+        cursor.execute('SELECT whale_wallet, question FROM trades WHERE id = ?', (trade_id,))
+        trade_row = cursor.fetchone()
+        
+        if trade_row:
+            whale_wallet = trade_row['whale_wallet']
+            question = trade_row.get('question', '')
+            
+            # Extract category
+            category = extract_market_category(question) if question else "other"
+            
+            # Update whale stats
+            is_win = pnl > 0
+            
+            cursor.execute('''
+                UPDATE whale_stats 
+                SET total_resolved = total_resolved + 1,
+                    total_wins = total_wins + ?,
+                    total_losses = total_losses + ?,
+                    total_pnl = total_pnl + ?
+                WHERE whale_wallet = ?
+            ''', (1 if is_win else 0, 1 if not is_win else 0, pnl, whale_wallet))
+            
+            # Recalculate win rate and avg PnL
+            cursor.execute('''
+                UPDATE whale_stats
+                SET win_rate = CASE 
+                    WHEN total_resolved > 0 THEN CAST(total_wins AS REAL) / total_resolved 
+                    ELSE 0 
+                END,
+                avg_pnl_per_trade = CASE 
+                    WHEN total_resolved > 0 THEN total_pnl / total_resolved 
+                    ELSE 0 
+                END
+                WHERE whale_wallet = ?
+            ''', (whale_wallet,))
+            
+            # Update category-specific stats
+            # First, get existing category stats to calculate win rate correctly
+            cursor.execute('''
+                SELECT total_trades, total_wins, total_losses, total_pnl
+                FROM whale_category_stats
+                WHERE whale_wallet = ? AND category = ?
+            ''', (whale_wallet, category))
+            existing = cursor.fetchone()
+            
+            if existing:
+                # Update existing category stats
+                new_wins = existing['total_wins'] + (1 if is_win else 0)
+                new_losses = existing['total_losses'] + (1 if not is_win else 0)
+                new_pnl = existing['total_pnl'] + pnl
+                new_total = new_wins + new_losses
+                new_win_rate = (new_wins / new_total) if new_total > 0 else 0
+                
+                cursor.execute('''
+                    UPDATE whale_category_stats
+                    SET total_trades = total_trades + 1,
+                        total_wins = ?,
+                        total_losses = ?,
+                        total_pnl = ?,
+                        win_rate = ?
+                    WHERE whale_wallet = ? AND category = ?
+                ''', (new_wins, new_losses, new_pnl, new_win_rate, whale_wallet, category))
+            else:
+                # Insert new category stats
+                new_win_rate = 1.0 if is_win else 0.0
+                cursor.execute('''
+                    INSERT INTO whale_category_stats (whale_wallet, category, total_trades, total_wins, total_losses, total_pnl, win_rate)
+                    VALUES (?, ?, 1, ?, ?, ?, ?)
+                ''', (whale_wallet, category, 1 if is_win else 0, 1 if not is_win else 0, pnl, new_win_rate))
+            
+            # Track successful trades (top 100 by PnL)
+            if pnl > 0:  # Only track profitable trades
+                cursor.execute('SELECT win_rate FROM whale_stats WHERE whale_wallet = ?', (whale_wallet,))
+                whale_stats = cursor.fetchone()
+                win_rate_at_time = whale_stats['win_rate'] if whale_stats else 0
+                
+                # Get full trade details for successful_trades table
+                cursor.execute('''
+                    SELECT market_id, outcome FROM trades WHERE id = ?
+                ''', (trade_id,))
+                trade_details = cursor.fetchone()
+                
+                cursor.execute('''
+                    INSERT INTO successful_trades (trade_id, whale_wallet, market_id, question, category, outcome, pnl, win_rate_at_time)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (trade_id, whale_wallet, trade_details['market_id'], question, category, 
+                      trade_details['outcome'], pnl, win_rate_at_time))
+                
+                # Keep only top 100 successful trades (delete lowest PnL if over limit)
+                cursor.execute('''
+                    DELETE FROM successful_trades 
+                    WHERE id NOT IN (
+                        SELECT id FROM successful_trades 
+                        ORDER BY pnl DESC 
+                        LIMIT 100
+                    )
+                ''')
 
     print(f"updated {len(trades_to_update)} trades as 'resolved' in database.")
 

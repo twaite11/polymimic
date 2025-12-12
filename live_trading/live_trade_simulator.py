@@ -38,6 +38,9 @@ SIMULATED_BET_AMOUNT = 1.0  # $1 per trade
 db_conn = None
 whale_wallets = set()
 api_session = requests.Session()
+messages_received = 0  # Track total messages received
+trades_checked = 0  # Track trades checked
+whale_trades_detected = 0  # Track whale trades found
 
 # new function to set up logging
 def setup_logging():
@@ -129,6 +132,56 @@ def setup_database():
                                                                   cumulative_pnl REAL NOT NULL
                        )
                        ''')
+        
+        # whale statistics table - tracks running performance per whale
+        cursor.execute('''
+                       CREATE TABLE IF NOT EXISTS whale_stats (
+                                                                  whale_wallet TEXT PRIMARY KEY,
+                                                                  total_trades INTEGER DEFAULT 0,
+                                                                  total_resolved INTEGER DEFAULT 0,
+                                                                  total_wins INTEGER DEFAULT 0,
+                                                                  total_losses INTEGER DEFAULT 0,
+                                                                  total_pnl REAL DEFAULT 0,
+                                                                  win_rate REAL DEFAULT 0,
+                                                                  avg_pnl_per_trade REAL DEFAULT 0,
+                                                                  last_trade_timestamp DATETIME,
+                                                                  categories TEXT,
+                                                                  insider_score REAL DEFAULT 0,
+                                                                  last_analyzed DATETIME
+                       )
+                       ''')
+        
+        # successful trades table - tracks top performing individual trades
+        cursor.execute('''
+                       CREATE TABLE IF NOT EXISTS successful_trades (
+                                                                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                                  trade_id INTEGER NOT NULL,
+                                                                  whale_wallet TEXT NOT NULL,
+                                                                  market_id TEXT NOT NULL,
+                                                                  question TEXT,
+                                                                  category TEXT,
+                                                                  outcome TEXT NOT NULL,
+                                                                  pnl REAL NOT NULL,
+                                                                  win_rate_at_time REAL,
+                                                                  timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                                                                  FOREIGN KEY (trade_id) REFERENCES trades(id)
+                       )
+                       ''')
+        
+        # whale category performance - tracks performance per category per whale
+        cursor.execute('''
+                       CREATE TABLE IF NOT EXISTS whale_category_stats (
+                                                                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                                  whale_wallet TEXT NOT NULL,
+                                                                  category TEXT NOT NULL,
+                                                                  total_trades INTEGER DEFAULT 0,
+                                                                  total_wins INTEGER DEFAULT 0,
+                                                                  total_losses INTEGER DEFAULT 0,
+                                                                  total_pnl REAL DEFAULT 0,
+                                                                  win_rate REAL DEFAULT 0,
+                                                                  UNIQUE(whale_wallet, category)
+                       )
+                       ''')
 
         db_conn.commit()
         logging.info(f"database '{DATABASE_FILE}' is ready.")
@@ -136,6 +189,72 @@ def setup_database():
     except sqlite3.Error as e:
         logging.error(f"error setting up database: {e}")
         sys.exit(1)
+
+# Market category keywords (simplified from create_market_groups.py)
+MARKET_KEYWORD_GROUPS = {
+    "us_politics": ["trump", "biden", "election", "republican", "democratic", "president", "senate", "house"],
+    "sports_nfl": ["nfl", "super bowl", "chiefs", "eagles", "football"],
+    "sports_nba": ["nba", "basketball", "lakers", "warriors", "celtics"],
+    "tech_ai": ["ai", "openai", "google", "apple", "meta", "tesla", "elon"],
+    "crypto": ["crypto", "bitcoin", "ethereum", "btc", "eth", "token"],
+    "finance": ["earnings", "stock", "market", "inflation", "fed", "interest"],
+    "geopolitics": ["ukraine", "russia", "china", "israel", "gaza", "nato"],
+    "entertainment": ["movie", "netflix", "taylor swift", "grammy", "oscar"]
+}
+
+def extract_market_category(question):
+    """
+    Extracts market category from question text.
+    Returns the first matching category or 'other'.
+    """
+    if not question or not isinstance(question, str):
+        return "other"
+    
+    q_lower = question.lower()
+    for category, keywords in MARKET_KEYWORD_GROUPS.items():
+        if any(keyword in q_lower for keyword in keywords):
+            return category
+    return "other"
+
+def update_whale_stats(whale_wallet, category, trade_id=None):
+    """
+    Updates running statistics for a whale after a trade is logged.
+    Called when a new trade is detected.
+    """
+    global db_conn
+    try:
+        cursor = db_conn.cursor()
+        
+        # Get current stats or initialize
+        cursor.execute('SELECT * FROM whale_stats WHERE whale_wallet = ?', (whale_wallet,))
+        stats = cursor.fetchone()
+        
+        if stats:
+            # Update existing stats
+            cursor.execute('''
+                UPDATE whale_stats 
+                SET total_trades = total_trades + 1,
+                    last_trade_timestamp = CURRENT_TIMESTAMP
+                WHERE whale_wallet = ?
+            ''', (whale_wallet,))
+        else:
+            # Initialize new whale stats
+            cursor.execute('''
+                INSERT INTO whale_stats (whale_wallet, total_trades, last_trade_timestamp, categories)
+                VALUES (?, 1, CURRENT_TIMESTAMP, ?)
+            ''', (whale_wallet, category))
+        
+        # Update category-specific stats
+        cursor.execute('''
+            INSERT INTO whale_category_stats (whale_wallet, category, total_trades)
+            VALUES (?, ?, 1)
+            ON CONFLICT(whale_wallet, category) 
+            DO UPDATE SET total_trades = total_trades + 1
+        ''', (whale_wallet, category))
+        
+        db_conn.commit()
+    except sqlite3.Error as e:
+        logging.error(f"error updating whale stats: {e}")
 
 def fetch_market_info(market_id):
     """
@@ -201,14 +320,22 @@ def log_trade(trade_data, whale_wallet):
 
         logging.info(f"whale trade detected! [wallet: {whale_wallet[:8]}... | market: {market_id[:8]}... | {side} {outcome} @ {price:.2f}]")
 
+        # Extract category from question
+        category = extract_market_category(question) if question else "other"
+
         cursor = db_conn.cursor()
         cursor.execute('''
                        INSERT INTO trades (whale_wallet, market_id, question, outcome, side, price, simulated_bet)
                        VALUES (?, ?, ?, ?, ?, ?, ?)
                        ''', (whale_wallet, market_id, question, outcome, side, price, SIMULATED_BET_AMOUNT))
+        
+        trade_id = cursor.lastrowid
         db_conn.commit()
 
-        logging.info(f"   -> simulated $1.00 trade logged to database.")
+        # Update whale statistics
+        update_whale_stats(whale_wallet, category, trade_id)
+
+        logging.info(f"   -> simulated $1.00 trade logged to database. [category: {category}]")
 
     except sqlite3.Error as e:
         logging.error(f"error logging trade to database: {e}")
@@ -219,6 +346,7 @@ def is_market_active(market_id):
     """
     checks if a market is still active (not closed/resolved).
     returns true if market is active, false if it's already resolved.
+    By default, assumes active if check fails (better to process than skip).
     """
     try:
         market_info = fetch_market_info(market_id)
@@ -233,17 +361,17 @@ def is_market_active(market_id):
         
         # market is active if it's not closed and not resolved
         if is_closed:
-            logging.debug(f"market {market_id[:8]}... is closed, skipping trade")
+            logging.info(f"market {market_id[:8]}... is closed, skipping trade")
             return False
         
         if resolution_status and resolution_status.upper() in ['FINAL', 'RESOLVED', 'RESOLVED_FINAL']:
-            logging.debug(f"market {market_id[:8]}... is resolved ({resolution_status}), skipping trade")
+            logging.info(f"market {market_id[:8]}... is resolved ({resolution_status}), skipping trade")
             return False
         
         # market is active
         return True
     except Exception as e:
-        logging.debug(f"error checking market status for {market_id[:8]}...: {e}")
+        logging.warning(f"error checking market status for {market_id[:8]}...: {e}")
         # if we can't check, assume it's active (better to process than skip)
         return True
 
@@ -251,14 +379,16 @@ def on_message(ws, message):
     """
     main websocket callback function for the rtds.
     """
-    global whale_wallets
+    global whale_wallets, messages_received, trades_checked, whale_trades_detected
 
+    messages_received += 1
     logging.debug(message) # will only print if debug_mode is on
 
     try:
         data = json.loads(message)
 
         if data.get("topic") == "activity" and data.get("type") == "orders_matched":
+            trades_checked += 1
             trade = data.get("payload")
             if not trade:
                 return
@@ -267,15 +397,17 @@ def on_message(ws, message):
             if not market_id:
                 return
 
-            # filter out trades for markets that are already closed/resolved
-            if not is_market_active(market_id):
-                logging.debug(f"skipping trade for resolved/closed market: {market_id[:8]}...")
-                return
-
             # check 1: is the taker one of our whales? (convert to lowercase)
             taker_wallet = trade.get('proxyWallet')
             if taker_wallet and taker_wallet.lower() in whale_wallets:
-                log_trade(trade, taker_wallet)
+                whale_trades_detected += 1
+                logging.info(f"🐋 WHALE TRADE DETECTED (taker): {taker_wallet[:10]}... in market {market_id[:10]}...")
+                # Only check market status AFTER confirming it's a whale trade
+                # This avoids unnecessary API calls for non-whale trades
+                if is_market_active(market_id):
+                    log_trade(trade, taker_wallet)
+                else:
+                    logging.info(f"skipping whale trade for resolved/closed market: {market_id[:8]}...")
                 return
 
             # check 2: is the maker one of our whales? (convert to lowercase)
@@ -286,7 +418,13 @@ def on_message(ws, message):
             for maker_order in maker_orders:
                 maker_wallet = maker_order.get('maker_address')
                 if maker_wallet and maker_wallet.lower() in whale_wallets:
-                    log_trade(trade, maker_wallet)
+                    whale_trades_detected += 1
+                    logging.info(f"🐋 WHALE TRADE DETECTED (maker): {maker_wallet[:10]}... in market {market_id[:10]}...")
+                    # Only check market status AFTER confirming it's a whale trade
+                    if is_market_active(market_id):
+                        log_trade(trade, maker_wallet)
+                    else:
+                        logging.info(f"skipping whale trade for resolved/closed market: {market_id[:8]}...")
                     break
 
     except json.JSONDecodeError:
@@ -346,8 +484,8 @@ def on_open(ws):
 
     ws.send(json.dumps(subscribe_message))
     logging.info("sent authenticated subscription request for 'activity' feed.")
-    logging.info(f"bot is now silently listening... (will print '.' every {HEARTBEAT_INTERVAL}s if DEBUG_MODE is on)")
-    logging.info("note: connection issues will auto-reconnect silently")
+    logging.info(f"waiting for trade messages... (will print '.' every {HEARTBEAT_INTERVAL}s if DEBUG_MODE is on)")
+    logging.info("note: connection issues will auto-reconnect automatically")
 
 def start_websocket():
     """
@@ -380,8 +518,14 @@ def start_websocket():
             # --- heartbeat thread ---
             # this loops in the main thread, printing a dot
             # so you know the script is alive.
+            last_status_time = time.time()
             while wst.is_alive():
                 time.sleep(HEARTBEAT_INTERVAL)
+                current_time = time.time()
+                # Print status every 5 minutes
+                if current_time - last_status_time >= 300:  # 5 minutes
+                    logging.info(f"💓 Status: {messages_received} messages received, {trades_checked} trades checked, {whale_trades_detected} whale trades detected")
+                    last_status_time = current_time
                 logging.debug(".")  # prints a dot to the log in debug mode
             # --- end heartbeat ---
 
@@ -415,8 +559,12 @@ if __name__ == "__main__":
     setup_database()
 
     logging.info(f"starting live trade simulator bot. this will run 24/7.")
+    logging.info(f"monitoring {len(whale_wallets)} whale wallets for trades.")
     logging.info(f"only processing trades for active markets (not closed/resolved).")
+    logging.info(f"websocket URL: {WEBSOCKET_URL}")
     if DEBUG_MODE:
         logging.info("--- debug mode is on: all live data will be logged ---")
+    else:
+        logging.info("--- tip: set DEBUG_MODE=True to see all websocket messages ---")
     logging.info("press CTRL+C to stop.")
     start_websocket()
