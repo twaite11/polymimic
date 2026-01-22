@@ -240,7 +240,8 @@ markets are automatically categorized into groups such as:
 - `id`: primary key
 - `timestamp`: date
 - `cumulative_pnl`: running total p&l
-
+---history table update---
+  full logging feature to understand bug troubleshooting 
 ---
 
 **polymimic** - because sometimes the best trading strategy is to follow the smart money.
